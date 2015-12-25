@@ -5,22 +5,26 @@ module Yomikomu
 
   unless yomu_dir = ENV['YOMIKOMU_STORAGE_DIR']
     yomu_dir = File.expand_path("~/.ruby_binaries")
-    unless File.exist?(yomu_dir)
-      Dir.mkdir(yomu_dir)
-    end
+    Dir.mkdir(yomu_dir) unless File.exist?(yomu_dir)
   end
   YOMIKOMU_PREFIX = "#{yomu_dir}/cb."
   YOMIKOMU_AUTO_COMPILE = ENV['YOMIKOMU_AUTO_COMPILE'] == 'true'
   YOMIKOMU_USE_MMAP = ENV['YOMIKOMU_USE_MMAP']
+  require_relative 'yomikomu/mmap_string'
+
+  YOMIKOMU_GZ = ENV['YOMIKOMU_GZ'] == 'true'
+  if YOMIKOMU_GZ
+    require 'zlib'
+    YOMIKOMU_GZ_LEVEL = Integer(ENV.fetch('YOMIKOMU_GZ_LEVEL', Zlib::DEFAULT_COMPRESSION))
+  end
 
   if $VERBOSE
     def self.info
       STDERR.puts "[YOMIKOMU:INFO] (pid:#{Process.pid}) #{yield}"
     end
-    at_exit{
-      STDERR.puts "[YOMIKOMU:INFO] (pid:#{Process.pid}) " +
-                  ::Yomikomu::STATISTICS.map{|k, v| "#{k}: #{v}"}.join(' ,')
-    }
+    at_exit do
+      STDERR.puts "[YOMIKOMU:INFO] (pid:#{Process.pid}) " + ::Yomikomu::STATISTICS.map { |k, v| "#{k}: #{v}" }.join(' ,')
+    end
   else
     def self.info
     end
@@ -35,220 +39,45 @@ module Yomikomu
     end
   end
 
-  class NullStorage
-    def load_iseq fname; end
-    def compile_and_store_iseq fname; end
-    def remove_compiled_iseq fname; end
+  def self.compile_and_store_iseq(fname)
+    STORAGE.compile_and_store_iseq(fname)
   end
 
-  class BasicStorage
-    def initialize
-      require 'digest/sha1'
-    end
-
-    def load_iseq fname
-      iseq_key = iseq_key_name(fname)
-
-      if compiled_iseq_exist?(fname, iseq_key) && compiled_iseq_is_younger?(fname, iseq_key)
-        ::Yomikomu::STATISTICS[:loaded] += 1
-        ::Yomikomu.debug{ "load #{fname} from #{iseq_key}" }
-        binary = read_compiled_iseq(fname, iseq_key)
-        iseq = RubyVM::InstructionSequence.load_from_binary(binary)
-        # p [extra_data(iseq.path), RubyVM::InstructionSequence.load_from_binary_extra_data(binary)]
-        # raise unless extra_data(iseq.path) == RubyVM::InstructionSequence.load_from_binary_extra_data(binary)
-        iseq
-      elsif YOMIKOMU_AUTO_COMPILE
-        compile_and_store_iseq(fname, iseq_key)
-      else
-        ::Yomikomu::STATISTICS[:ignored] += 1
-        ::Yomikomu.debug{ "ignored #{fname}" }
-        nil
-      end
-    end
-
-    def extra_data fname
-      "SHA-1:#{::Digest::SHA1.file(fname).digest}"
-    end
-
-    def compile_and_store_iseq fname, iseq_key = iseq_key_name(fname)
-      ::Yomikomu::STATISTICS[:compiled] += 1
-      ::Yomikomu.debug{ "[RUBY_COMPILED_FILE] compile #{fname} into #{iseq_key}" }
-      iseq = RubyVM::InstructionSequence.compile_file(fname)
-
-      binary = iseq.to_binary(extra_data(fname))
-      write_compiled_iseq(fname, iseq_key, binary)
-      iseq
-    end
-
-    # def remove_compiled_iseq fname; nil; end # should implement at sub classes
-
-    private
-
-    def iseq_key_name fname
-      fname
-    end
-
-    # should implement at sub classes
-    # def compiled_iseq_younger? fname, iseq_key; end
-    # def compiled_iseq_exist? fname, iseq_key; end
-    # def read_compiled_file fname, iseq_key; end
-    # def write_compiled_file fname, iseq_key, binary; end
-  end
-
-  class FSStorage < BasicStorage
-    def initialize
-      super
-      require 'fileutils'
-      @dir = YOMIKOMU_PREFIX + "files"
-      unless File.directory?(@dir)
-        FileUtils.mkdir_p(@dir)
-      end
-    end
-
-    def remove_compiled_iseq fname
-      iseq_key = iseq_key_name(fname)
-      if File.exist?(iseq_key)
-        Yomikomu.debug{ "rm #{iseq_key}" }
-        File.unlink(iseq_key)
-      end
-    end
-
-    private
-
-    def iseq_key_name fname
-      "#{fname}.yarb" # same directory
-    end
-
-    def compiled_iseq_exist? fname, iseq_key
-      File.exist?(iseq_key)
-    end
-
-    def compiled_iseq_is_younger? fname, iseq_key
-      File.mtime(iseq_key) >= File.mtime(fname)
-    end
-
-    def read_compiled_iseq fname, iseq_key
-      File.binread(iseq_key)
-    end
-
-    def write_compiled_iseq fname, iseq_key, binary
-      File.binwrite(iseq_key, binary)
-    end
-
-    def remove_all_compiled_iseq
-      raise "unsupported"
-    end
-  end
-
-  class FS2Storage < FSStorage
-    def iseq_key_name fname
-      File.join(@dir, fname.gsub(/[^A-Za-z0-9\._-]/){|c| '%02x' % c.ord} + '.yarb') # special directory
-    end
-
-    def remove_all_compiled_iseq
-      Dir.glob(File.join(@dir, '**/*.yarb')){|path|
-        Yomikomu.debug{ "rm #{path}" }
-        FileUtils.rm(path)
-      }
-    end
-  end
-
-  if YOMIKOMU_USE_MMAP
-    require 'mmapped_string'
-    Yomikomu.info{ "[RUBY_YOMIKOMU] use mmap" }
-
-    module MMapFile
-      def read_compiled_iseq fname, iseq_key
-        MmappedString.open(iseq_key)
-      end
-    end
-
-    class FSStorage
-      prepend MMapFile
-    end
-
-    class FS2Storage
-      prepend MMapFile
-    end
-  end
-
-  class DBMStorage < BasicStorage
-    def initialize
-      require 'dbm'
-      @db = DBM.open(YOMIKOMU_PREFIX+'db')
-    end
-
-    def remove_compiled_iseq fname
-      @db.delete fname
-    end
-
-    private
-
-    def date_key_name fname
-      "date.#{fname}"
-    end
-
-    def iseq_key_name fname
-      "body.#{fname}"
-    end
-
-    def compiled_iseq_exist? fname, iseq_key
-      @db.has_key? iseq_key
-    end
-
-    def compiled_iseq_is_younger? fname, iseq_key
-      date_key = date_key_name(fname)
-      if @db.has_key? date_key
-        @db[date_key].to_i >= File.mtime(fname).to_i
-      end
-    end
-
-    def read_compiled_iseq fname, iseq_key
-      @db[iseq_key]
-    end
-
-    def write_compiled_iseq fname, iseq_key, binary
-      date_key = date_key_name(fname)
-      @db[iseq_key] = binary
-      @db[date_key] = Time.now.to_i
-    end
-  end
-
-  def self.compile_and_store_iseq fname
-    STORAGE.compile_and_store_iseq fname
-  end
-
-  def self.remove_compiled_iseq fname
-    STORAGE.remove_compiled_iseq fname
+  def self.remove_compiled_iseq(fname)
+    STORAGE.remove_compiled_iseq(fname)
   end
 
   def self.remove_all_compiled_iseq
     STORAGE.remove_all_compiled_iseq
   end
 
-  def self.verify_compiled_iseq fname
-    STORAGE.verify_compiled_iseq fname
+  def self.verify_compiled_iseq(fname)
+    STORAGE.verify_compiled_iseq(fname)
   end
 
   # select storage
   STORAGE = case ENV['YOMIKOMU_STORAGE']
             when 'dbm'
+              require_relative 'yomikomu/dbm_storage'
               DBMStorage.new
-            when 'fs'
-              FSStorage.new
             when 'fs2'
+              require_relative 'yomikomu/mmap_string'
+              require_relative 'yomikomu/fs2_storage'
               FS2Storage.new
             when 'null'
+              require_relative 'yomikomu/null_storage'
               NullStorage.new
             else
+              require_relative 'yomikomu/mmap_string'
+              require_relative 'yomikomu/fs_storage'
               FSStorage.new
             end
 
-  Yomikomu.info{ "[RUBY_YOMIKOMU] use #{STORAGE.class}" }
+  Yomikomu.info { "[RUBY_YOMIKOMU] use #{STORAGE.class}" }
 end
 
 class RubyVM::InstructionSequence
-  def self.load_iseq fname
+  def self.load_iseq(fname)
     ::Yomikomu::STORAGE.load_iseq(fname)
   end
 end
